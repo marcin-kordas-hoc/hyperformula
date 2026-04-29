@@ -35,7 +35,7 @@ Critical rules:
 - **Svelte:** always `onDestroy(() => hf.destroy())` — omitting it leaks the engine
 - **React:** pattern survives `StrictMode` double-invocation (mount→unmount→mount)
 - **Angular:** `providedIn: 'root'` services live for the app lifetime — scope to component for per-feature cleanup
-- **SSR:** HF depends on browser-only APIs — guard with framework's client-only mechanism
+- **SSR:** HF has no browser-only API dependencies, but server-side construction is wasted work — guard with the framework's client-only mechanism
 
 Full guide with TypeScript snippets: `docs/guide/integration-with-{react,angular,vue,svelte}.md`
 
@@ -74,7 +74,7 @@ SimpleCellAddress // { sheet: number, row: number, col: number }
 - Passing HF instance into Vue `reactive()` / `ref()` without `markRaw` → cryptic TypeError
 - Forgetting `licenseKey` in config → silent warning, no crash, confusing for users
 - Using `unknown` type for `setCellContents` value arg → use `RawCellContent`
-- SSR: importing `hyperformula` at module scope in Next.js/Nuxt/SvelteKit → server crash
+- SSR: importing `hyperformula` at module scope in Next.js/Nuxt/SvelteKit → wasted server-side initialization (engine constructed but never used in the rendered output)
 - Array functions: HF uses **parse-time array sizing** — output dimensions determined before evaluation
 
 ## Build and test
