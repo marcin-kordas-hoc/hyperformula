@@ -21,6 +21,7 @@ export const dictionary: RawTranslationPackage = {
     FILTER: 'FILTER',
     VSTACK: 'VSTACK',
     HSTACK: 'HSTACK',
+    UNIQUE: 'UNIQUE',
     ADDRESS: 'DIRECCION',
     'ARRAY_CONSTRAIN': 'ARRAY_CONSTRAIN',
     ARRAYFORMULA: 'ARRAYFORMULA',

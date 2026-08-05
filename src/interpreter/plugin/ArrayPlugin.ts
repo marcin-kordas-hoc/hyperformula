@@ -9,7 +9,7 @@ import {ErrorMessage} from '../../error-message'
 import {AstNodeType, ProcedureAst} from '../../parser'
 import {coerceScalarToBoolean} from '../ArithmeticHelper'
 import {InterpreterState} from '../InterpreterState'
-import {InternalScalarValue, InterpreterValue} from '../InterpreterValue'
+import {InternalNoErrorScalarValue, InternalScalarValue, InterpreterValue} from '../InterpreterValue'
 import {SimpleRangeValue} from '../../SimpleRangeValue'
 import {FunctionArgumentType, FunctionPlugin, FunctionPluginTypecheck, ImplementedFunctions} from './FunctionPlugin'
 
@@ -60,6 +60,17 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
         {argumentType: FunctionArgumentType.RANGE},
       ],
       repeatLastArgs: 1,
+    },
+    'UNIQUE': {
+      method: 'unique',
+      sizeOfResultArrayMethod: 'uniqueArraySize',
+      enableArrayArithmeticForArguments: true,
+      parameters: [
+        {argumentType: FunctionArgumentType.RANGE},
+        {argumentType: FunctionArgumentType.BOOLEAN, defaultValue: false, emptyAsDefault: true},
+        {argumentType: FunctionArgumentType.BOOLEAN, defaultValue: false, emptyAsDefault: true},
+      ],
+      vectorizationForbidden: true,
     },
   }
 
@@ -261,6 +272,126 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
     const width = subChecks.reduce((total, size) => total + size.width, 0)
     const height = Math.max(...subChecks.map(size => size.height))
     return new ArraySize(width, height)
+  }
+
+  /**
+   * Corresponds to UNIQUE(array, [by_col], [exactly_once]).
+   *
+   * Returns the distinct rows of `array` (or its distinct columns when `by_col`
+   * is TRUE), preserving the order of first occurrence. When `exactly_once` is
+   * TRUE only the rows/columns that occur exactly once are returned. Value
+   * equality is delegated to {@link ArithmeticHelper}, so it honours the
+   * `caseSensitive` and `accentSensitive` config options (case-insensitive by
+   * default) and the engine's mixed-type equality rules; repeated empty cells
+   * therefore collapse to a single entry. An error anywhere in the input range
+   * is propagated. HyperFormula has no #CALC!, so an empty result is reported as
+   * #N/A (EmptyRange), mirroring FILTER.
+   *
+   * @param ast - the parsed function-call AST node
+   * @param state - current interpreter evaluation state
+   */
+  public unique(ast: ProcedureAst, state: InterpreterState): InterpreterValue {
+    return this.runFunction(ast.args, state, this.metadata('UNIQUE'),
+      (range: SimpleRangeValue, byCol: boolean, exactlyOnce: boolean) => {
+        const data = range.data
+
+        const firstError = this.findFirstError(data)
+        if (firstError !== undefined) {
+          return firstError
+        }
+
+        // An empty input range (e.g. a whole-column reference to an empty sheet)
+        // has no rows/columns to keep. Return #N/A rather than letting the empty
+        // 2-D array reach SimpleRangeValue.onlyValues. Mirrors FILTER/SORT.
+        if (data.length === 0 || data[0].length === 0) {
+          return new CellError(ErrorType.NA, ErrorMessage.EmptyRange)
+        }
+
+        const height = range.height()
+        const width = range.width()
+
+        // The lines being deduped are rows by default, or columns when by_col.
+        const lines: InternalScalarValue[][] = byCol
+          ? Array.from({length: width}, (_, c) => data.map(row => row[c]))
+          : data.map(row => row.slice())
+
+        // First-occurrence dedupe: keep one representative per distinct line and
+        // count how many times each occurs (needed for exactly_once).
+        const representatives: InternalScalarValue[][] = []
+        const occurrences: number[] = []
+        for (const line of lines) {
+          const index = representatives.findIndex(representative => this.linesEqual(representative, line))
+          if (index === -1) {
+            representatives.push(line)
+            occurrences.push(1)
+          } else {
+            occurrences[index] += 1
+          }
+        }
+
+        const kept = representatives.filter((_, i) => !exactlyOnce || occurrences[i] === 1)
+        if (kept.length === 0) {
+          return new CellError(ErrorType.NA, ErrorMessage.EmptyRange)
+        }
+
+        // Reassemble: kept lines are rows (default) or columns (by_col).
+        const result: InternalScalarValue[][] = byCol
+          ? Array.from({length: height}, (_, r) => kept.map(column => column[r]))
+          : kept
+        return SimpleRangeValue.onlyValues(result)
+      }
+    )
+  }
+
+  /**
+   * Predicts the output array size for UNIQUE at parse time. The result never
+   * has more rows/columns than the input (every line distinct), so the input
+   * shape is the maximum spill footprint. A fresh {@link ArraySize} is returned
+   * so the input's `isRef` flag is not propagated — a ref-flagged size is
+   * treated as scalar and would collapse the spilled result into a single cell.
+   *
+   * @param ast - the parsed function-call AST node
+   * @param state - current interpreter evaluation state
+   */
+  public uniqueArraySize(ast: ProcedureAst, state: InterpreterState): ArraySize {
+    if (ast.args.length < 1 || ast.args.length > 3) {
+      return ArraySize.error()
+    }
+
+    const metadata = this.metadata('UNIQUE')
+    const subChecks = ast.args.map((arg) => this.arraySizeForAst(arg, new InterpreterState(state.formulaAddress, state.arraysFlag || (metadata?.enableArrayArithmeticForArguments ?? false))))
+    return new ArraySize(subChecks[0].width, subChecks[0].height)
+  }
+
+  /** Returns the first {@link CellError} found in a 2-D array, or undefined. */
+  private findFirstError(data: InternalScalarValue[][]): CellError | undefined {
+    for (const row of data) {
+      for (const cell of row) {
+        if (cell instanceof CellError) {
+          return cell
+        }
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Two lines are equal when they have the same length and every cell pair is
+   * equal under {@link ArithmeticHelper.eq} (which honours caseSensitive /
+   * accentSensitive). Callers must strip errors first, so cells are cast to the
+   * error-free scalar type.
+   *
+   * @param left - the stored representative line
+   * @param right - the candidate line being tested for duplication
+   */
+  private linesEqual(left: InternalScalarValue[], right: InternalScalarValue[]): boolean {
+    if (left.length !== right.length) {
+      return false
+    }
+    return left.every((cell, i) => this.arithmeticHelper.eq(
+      cell as InternalNoErrorScalarValue,
+      right[i] as InternalNoErrorScalarValue,
+    ))
   }
 
   /**

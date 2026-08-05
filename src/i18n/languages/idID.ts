@@ -21,6 +21,7 @@ const dictionary: RawTranslationPackage = {
     FILTER: 'FILTER',
     VSTACK: 'VSTACK',
     HSTACK: 'HSTACK',
+    UNIQUE: 'UNIQUE',
     ADDRESS: 'ALAMAT',
     'ARRAY_CONSTRAIN': 'BATASAN.MATRIKS',
     ARRAYFORMULA: 'RUMUS.MATRIKS',

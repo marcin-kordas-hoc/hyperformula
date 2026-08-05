@@ -46,6 +46,12 @@ a circular reference.
 
 * Ordering (including mixed types, empty cells, and text collation) follows HyperFormula's own comparison rules, which honor the `caseSensitive` and `accentSensitive` configuration options. Numbers sort before text, and text before logical values.
 
+### UNIQUE function
+
+* Value equality follows HyperFormula's own comparison rules, which honor the `caseSensitive` and `accentSensitive` configuration options (case-insensitive and accent-insensitive by default). As with the rest of the engine, an empty cell compares equal to `0` and to an empty string, so blanks may collapse together with those values rather than staying distinct as they would in Excel.
+
+* HyperFormula has no `#CALC!` error. When the result would be empty (for example, `ExactlyOnce` set to `TRUE` removes every row), the function returns `#N/A` instead, mirroring the FILTER function.
+
 ### OFFSET function
 
 HyperFormula resolves the OFFSET function at parse time rather than during evaluation. The parser inspects the arguments and rewrites the expression into a plain cell reference or range. This keeps the dependency graph accurate but imposes several restrictions.
