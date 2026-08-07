@@ -48,9 +48,9 @@ a circular reference.
 
 ### UNIQUE function
 
-* Value equality follows HyperFormula's own comparison rules, which honor the `caseSensitive` and `accentSensitive` configuration options (case-insensitive and accent-insensitive by default). As with the rest of the engine, an empty cell compares equal to `0` and to an empty string, so blanks may collapse together with those values rather than staying distinct as they would in Excel.
+* Value equality follows HyperFormula's own comparison rules, which honor the `caseSensitive` and `accentSensitive` configuration options (case-insensitive and accent-insensitive by default). As with the rest of the engine, an empty cell compares equal to `0` and to an empty string, so blanks collapse together with those values.
 
-* HyperFormula has no `#CALC!` error. When the result would be empty (for example, `ExactlyOnce` set to `TRUE` removes every row), the function returns `#N/A` instead, mirroring the FILTER function.
+* When the result would be empty (for example, `ExactlyOnce` set to `TRUE` removes every row), the function returns the `#N/A` error, mirroring the FILTER function.
 
 ### OFFSET function
 
