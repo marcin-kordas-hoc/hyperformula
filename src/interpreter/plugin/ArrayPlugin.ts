@@ -7,9 +7,9 @@ import {ArraySize} from '../../ArraySize'
 import {CellError, ErrorType} from '../../Cell'
 import {ErrorMessage} from '../../error-message'
 import {AstNodeType, ProcedureAst} from '../../parser'
-import {coerceScalarToBoolean} from '../ArithmeticHelper'
+import {coerceScalarToBoolean, normalizeString} from '../ArithmeticHelper'
 import {InterpreterState} from '../InterpreterState'
-import {InternalScalarValue, InterpreterValue} from '../InterpreterValue'
+import {EmptyValue, getRawValue, InternalNoErrorScalarValue, InternalScalarValue, InterpreterValue, isExtendedNumber} from '../InterpreterValue'
 import {SimpleRangeValue} from '../../SimpleRangeValue'
 import {FunctionArgumentType, FunctionPlugin, FunctionPluginTypecheck, ImplementedFunctions} from './FunctionPlugin'
 
@@ -60,6 +60,17 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
         {argumentType: FunctionArgumentType.RANGE},
       ],
       repeatLastArgs: 1,
+    },
+    'UNIQUE': {
+      method: 'unique',
+      sizeOfResultArrayMethod: 'uniqueArraySize',
+      enableArrayArithmeticForArguments: true,
+      parameters: [
+        {argumentType: FunctionArgumentType.RANGE},
+        {argumentType: FunctionArgumentType.BOOLEAN, defaultValue: false, emptyAsDefault: true},
+        {argumentType: FunctionArgumentType.BOOLEAN, defaultValue: false, emptyAsDefault: true},
+      ],
+      vectorizationForbidden: true,
     },
   }
 
@@ -261,6 +272,211 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
     const width = subChecks.reduce((total, size) => total + size.width, 0)
     const height = Math.max(...subChecks.map(size => size.height))
     return new ArraySize(width, height)
+  }
+
+  /**
+   * Corresponds to UNIQUE(array, [by_col], [exactly_once]).
+   *
+   * Returns the distinct rows of `array` (or its distinct columns when `by_col`
+   * is TRUE), preserving the order of first occurrence. When `exactly_once` is
+   * TRUE only the rows/columns that occur exactly once are returned. Text
+   * equality honours the `caseSensitive` and `accentSensitive` config options
+   * (both insensitive by default). An empty cell is treated as a distinct value
+   * — it is not equal to `0` or to an empty string — though repeated empty cells
+   * collapse into one. Numbers are matched by their exact stored value, so the
+   * engine's floating-point tolerance is not applied (see the known-limitations
+   * guide). An error anywhere in the input range is propagated. HyperFormula has
+   * no #CALC!, so an empty result is reported as #N/A (EmptyRange), mirroring
+   * FILTER.
+   *
+   * @param ast - the parsed function-call AST node
+   * @param state - current interpreter evaluation state
+   */
+  public unique(ast: ProcedureAst, state: InterpreterState): InterpreterValue {
+    return this.runFunction(ast.args, state, this.metadata('UNIQUE'),
+      (range: SimpleRangeValue, byCol: boolean, exactlyOnce: boolean) => {
+        const data = range.data
+
+        const firstError = this.findFirstError(data)
+        if (firstError !== undefined) {
+          return firstError
+        }
+
+        // An empty input range (e.g. a whole-column reference to an empty sheet)
+        // has no rows/columns to keep. Return #N/A rather than letting the empty
+        // 2-D array reach SimpleRangeValue.onlyValues. Mirrors FILTER/SORT.
+        if (data.length === 0 || data[0].length === 0) {
+          return new CellError(ErrorType.NA, ErrorMessage.EmptyRange)
+        }
+
+        const height = range.height()
+        const width = range.width()
+
+        // The lines being deduped are rows by default, or columns when by_col.
+        const lines: InternalScalarValue[][] = byCol
+          ? Array.from({length: width}, (_, c) => data.map(row => row[c]))
+          : data.map(row => row.slice())
+
+        // First-occurrence dedupe: keep one representative per distinct line and
+        // count how many times each occurs (needed for exactly_once). A hash of
+        // each line (see lineKey) buckets candidates so we only run the exact
+        // ArithmeticHelper equality against representatives that share a key,
+        // turning the naive O(lines²) scan into an O(lines) pass. linesEqual
+        // remains the authority within a bucket, so a key collision never merges
+        // distinct lines. Cells are keyed by exact value (folding in the same
+        // caseSensitive/accentSensitive rules the comparator uses for text), so
+        // an empty cell, 0, and "" fall in separate buckets — empties stay
+        // distinct, matching the spec — and numbers equal only within the
+        // engine's floating-point tolerance are likewise not collapsed.
+        const representatives: InternalScalarValue[][] = []
+        const occurrences: number[] = []
+        const bucketsByKey = new Map<string, number[]>()
+        for (const line of lines) {
+          const key = this.lineKey(line)
+          const bucket = bucketsByKey.get(key)
+          const index = bucket === undefined
+            ? -1
+            : (bucket.find(i => this.linesEqual(representatives[i], line)) ?? -1)
+          if (index === -1) {
+            const newIndex = representatives.length
+            representatives.push(line)
+            occurrences.push(1)
+            if (bucket === undefined) {
+              bucketsByKey.set(key, [newIndex])
+            } else {
+              bucket.push(newIndex)
+            }
+          } else {
+            occurrences[index] += 1
+          }
+        }
+
+        const kept = representatives.filter((_, i) => !exactlyOnce || occurrences[i] === 1)
+        if (kept.length === 0) {
+          return new CellError(ErrorType.NA, ErrorMessage.EmptyRange)
+        }
+
+        // Reassemble: kept lines are rows (default) or columns (by_col).
+        const result: InternalScalarValue[][] = byCol
+          ? Array.from({length: height}, (_, r) => kept.map(column => column[r]))
+          : kept
+        return SimpleRangeValue.onlyValues(result)
+      }
+    )
+  }
+
+  /**
+   * Predicts the output array size for UNIQUE at parse time. The result never
+   * has more rows/columns than the input (every line distinct), so the input
+   * shape is the maximum spill footprint. A fresh {@link ArraySize} is returned
+   * so the input's `isRef` flag is not propagated — a ref-flagged size is
+   * treated as scalar and would collapse the spilled result into a single cell.
+   *
+   * @param ast - the parsed function-call AST node
+   * @param state - current interpreter evaluation state
+   */
+  public uniqueArraySize(ast: ProcedureAst, state: InterpreterState): ArraySize {
+    if (ast.args.length < 1 || ast.args.length > 3) {
+      return ArraySize.error()
+    }
+
+    const metadata = this.metadata('UNIQUE')
+    const subChecks = ast.args.map((arg) => this.arraySizeForAst(arg, new InterpreterState(state.formulaAddress, state.arraysFlag || (metadata?.enableArrayArithmeticForArguments ?? false))))
+    return new ArraySize(subChecks[0].width, subChecks[0].height)
+  }
+
+  /** Returns the first {@link CellError} found in a 2-D array, or undefined. */
+  private findFirstError(data: InternalScalarValue[][]): CellError | undefined {
+    for (const row of data) {
+      for (const cell of row) {
+        if (cell instanceof CellError) {
+          return cell
+        }
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Two lines are equal when they have the same length and every cell pair is
+   * equal under {@link ArithmeticHelper.eq} (which honours caseSensitive /
+   * accentSensitive). Callers must strip errors first, so cells are cast to the
+   * error-free scalar type.
+   *
+   * @param left - the stored representative line
+   * @param right - the candidate line being tested for duplication
+   */
+  private linesEqual(left: InternalScalarValue[], right: InternalScalarValue[]): boolean {
+    if (left.length !== right.length) {
+      return false
+    }
+    return left.every((cell, i) => this.arithmeticHelper.eq(
+      cell as InternalNoErrorScalarValue,
+      right[i] as InternalNoErrorScalarValue,
+    ))
+  }
+
+  /**
+   * Builds a string key that groups lines which {@link linesEqual} may consider
+   * equal into the same hash bucket. Each cell is keyed by a type tag plus a
+   * normalized payload, and the cell keys are joined into a line key. The key is
+   * a fast pre-filter, not a decision: {@link unique} still confirms every
+   * candidate with `linesEqual`, so a key collision only widens a bucket, it
+   * never merges distinct lines.
+   *
+   * @param line - the row (or column) whose cells are hashed
+   */
+  private lineKey(line: InternalScalarValue[]): string {
+    return line.map(cell => this.cellKey(cell)).join(' ')
+  }
+
+  /**
+   * Keys a single cell for {@link lineKey}. Strings are folded with the same
+   * caseSensitive / accentSensitive rules {@link ArithmeticHelper} applies, so
+   * values the comparator treats as equal (e.g. "Apple"/"apple" by default)
+   * produce the same key; numbers are keyed by their raw value so rich-number
+   * wrappers (dates, currency, …) collide with the plain number they equal.
+   *
+   * @param cell - the scalar value to key (errors are stripped by the caller)
+   */
+  private cellKey(cell: InternalScalarValue): string {
+    if (cell === EmptyValue) {
+      return 'e'
+    }
+    if (typeof cell === 'string') {
+      return `s:${this.foldString(cell)}`
+    }
+    if (typeof cell === 'boolean') {
+      return cell ? 'b:1' : 'b:0'
+    }
+    if (isExtendedNumber(cell)) {
+      return `n:${getRawValue(cell)}`
+    }
+    return `x:${String(cell)}`
+  }
+
+  /**
+   * Applies the case- and accent-folding used by {@link ArithmeticHelper} when
+   * comparing strings, mirroring its private `normalizeString`: lower-case when
+   * the engine is case-insensitive, then strip combining marks when it is
+   * accent-insensitive.
+   *
+   * @param str - the string to fold
+   */
+  private foldString(str: string): string {
+    let folded = str
+    if (!this.config.caseSensitive) {
+      folded = folded.toLowerCase()
+    }
+    if (!this.config.accentSensitive) {
+      folded = Array.from(normalizeString(folded, 'nfd'))
+        .filter(char => {
+          const code = char.charCodeAt(0)
+          return code < 0x300 || code > 0x36f
+        })
+        .join('')
+    }
+    return folded
   }
 
   /**

@@ -21,6 +21,7 @@ const dictionary: RawTranslationPackage = {
     FILTER: 'FILTER',
     VSTACK: 'VSTACK',
     HSTACK: 'HSTACK',
+    UNIQUE: 'UNIQUE',
     ADDRESS: 'ADRESS',
     'ARRAY_CONSTRAIN': 'ARRAY_CONSTRAIN',
     ARRAYFORMULA: 'ARRAYFORMULA',
