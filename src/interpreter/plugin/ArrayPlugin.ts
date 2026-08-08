@@ -7,9 +7,9 @@ import {ArraySize} from '../../ArraySize'
 import {CellError, ErrorType} from '../../Cell'
 import {ErrorMessage} from '../../error-message'
 import {AstNodeType, ProcedureAst} from '../../parser'
-import {coerceScalarToBoolean} from '../ArithmeticHelper'
+import {coerceScalarToBoolean, normalizeString} from '../ArithmeticHelper'
 import {InterpreterState} from '../InterpreterState'
-import {InternalNoErrorScalarValue, InternalScalarValue, InterpreterValue} from '../InterpreterValue'
+import {EmptyValue, getRawValue, InternalNoErrorScalarValue, InternalScalarValue, InterpreterValue, isExtendedNumber} from '../InterpreterValue'
 import {SimpleRangeValue} from '../../SimpleRangeValue'
 import {FunctionArgumentType, FunctionPlugin, FunctionPluginTypecheck, ImplementedFunctions} from './FunctionPlugin'
 
@@ -316,14 +316,31 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
           : data.map(row => row.slice())
 
         // First-occurrence dedupe: keep one representative per distinct line and
-        // count how many times each occurs (needed for exactly_once).
+        // count how many times each occurs (needed for exactly_once). A hash of
+        // each line (see lineKey) buckets candidates so we only run the exact
+        // ArithmeticHelper equality against representatives that share a key,
+        // turning the naive O(lines²) scan into an O(lines) pass. The key folds
+        // in the same caseSensitive/accentSensitive rules the comparator uses,
+        // so equal lines always land in the same bucket; linesEqual remains the
+        // authority, so any key collision is still resolved correctly.
         const representatives: InternalScalarValue[][] = []
         const occurrences: number[] = []
+        const bucketsByKey = new Map<string, number[]>()
         for (const line of lines) {
-          const index = representatives.findIndex(representative => this.linesEqual(representative, line))
+          const key = this.lineKey(line)
+          const bucket = bucketsByKey.get(key)
+          const index = bucket === undefined
+            ? -1
+            : (bucket.find(i => this.linesEqual(representatives[i], line)) ?? -1)
           if (index === -1) {
+            const newIndex = representatives.length
             representatives.push(line)
             occurrences.push(1)
+            if (bucket === undefined) {
+              bucketsByKey.set(key, [newIndex])
+            } else {
+              bucket.push(newIndex)
+            }
           } else {
             occurrences[index] += 1
           }
@@ -392,6 +409,69 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
       cell as InternalNoErrorScalarValue,
       right[i] as InternalNoErrorScalarValue,
     ))
+  }
+
+  /**
+   * Builds a string key that groups lines which {@link linesEqual} may consider
+   * equal into the same hash bucket. Each cell is keyed by a type tag plus a
+   * normalized payload, and the cell keys are joined into a line key. The key is
+   * a fast pre-filter, not a decision: {@link unique} still confirms every
+   * candidate with `linesEqual`, so a key collision only widens a bucket, it
+   * never merges distinct lines.
+   *
+   * @param line - the row (or column) whose cells are hashed
+   */
+  private lineKey(line: InternalScalarValue[]): string {
+    return line.map(cell => this.cellKey(cell)).join(' ')
+  }
+
+  /**
+   * Keys a single cell for {@link lineKey}. Strings are folded with the same
+   * caseSensitive / accentSensitive rules {@link ArithmeticHelper} applies, so
+   * values the comparator treats as equal (e.g. "Apple"/"apple" by default)
+   * produce the same key; numbers are keyed by their raw value so rich-number
+   * wrappers (dates, currency, …) collide with the plain number they equal.
+   *
+   * @param cell - the scalar value to key (errors are stripped by the caller)
+   */
+  private cellKey(cell: InternalScalarValue): string {
+    if (cell === EmptyValue) {
+      return 'e'
+    }
+    if (typeof cell === 'string') {
+      return `s:${this.foldString(cell)}`
+    }
+    if (typeof cell === 'boolean') {
+      return cell ? 'b:1' : 'b:0'
+    }
+    if (isExtendedNumber(cell)) {
+      return `n:${getRawValue(cell)}`
+    }
+    return `x:${String(cell)}`
+  }
+
+  /**
+   * Applies the case- and accent-folding used by {@link ArithmeticHelper} when
+   * comparing strings, mirroring its private `normalizeString`: lower-case when
+   * the engine is case-insensitive, then strip combining marks when it is
+   * accent-insensitive.
+   *
+   * @param str - the string to fold
+   */
+  private foldString(str: string): string {
+    let folded = str
+    if (!this.config.caseSensitive) {
+      folded = folded.toLowerCase()
+    }
+    if (!this.config.accentSensitive) {
+      folded = Array.from(normalizeString(folded, 'nfd'))
+        .filter(char => {
+          const code = char.charCodeAt(0)
+          return code < 0x300 || code > 0x36f
+        })
+        .join('')
+    }
+    return folded
   }
 
   /**
