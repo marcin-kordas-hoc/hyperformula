@@ -279,13 +279,15 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
    *
    * Returns the distinct rows of `array` (or its distinct columns when `by_col`
    * is TRUE), preserving the order of first occurrence. When `exactly_once` is
-   * TRUE only the rows/columns that occur exactly once are returned. Value
-   * equality is delegated to {@link ArithmeticHelper}, so it honours the
-   * `caseSensitive` and `accentSensitive` config options (case-insensitive by
-   * default) and the engine's mixed-type equality rules; repeated empty cells
-   * therefore collapse to a single entry. An error anywhere in the input range
-   * is propagated. HyperFormula has no #CALC!, so an empty result is reported as
-   * #N/A (EmptyRange), mirroring FILTER.
+   * TRUE only the rows/columns that occur exactly once are returned. Text
+   * equality honours the `caseSensitive` and `accentSensitive` config options
+   * (both insensitive by default). An empty cell is treated as a distinct value
+   * — it is not equal to `0` or to an empty string — though repeated empty cells
+   * collapse into one. Numbers are matched by their exact stored value, so the
+   * engine's floating-point tolerance is not applied (see the known-limitations
+   * guide). An error anywhere in the input range is propagated. HyperFormula has
+   * no #CALC!, so an empty result is reported as #N/A (EmptyRange), mirroring
+   * FILTER.
    *
    * @param ast - the parsed function-call AST node
    * @param state - current interpreter evaluation state
@@ -319,10 +321,13 @@ export class ArrayPlugin extends FunctionPlugin implements FunctionPluginTypeche
         // count how many times each occurs (needed for exactly_once). A hash of
         // each line (see lineKey) buckets candidates so we only run the exact
         // ArithmeticHelper equality against representatives that share a key,
-        // turning the naive O(lines²) scan into an O(lines) pass. The key folds
-        // in the same caseSensitive/accentSensitive rules the comparator uses,
-        // so equal lines always land in the same bucket; linesEqual remains the
-        // authority, so any key collision is still resolved correctly.
+        // turning the naive O(lines²) scan into an O(lines) pass. linesEqual
+        // remains the authority within a bucket, so a key collision never merges
+        // distinct lines. Cells are keyed by exact value (folding in the same
+        // caseSensitive/accentSensitive rules the comparator uses for text), so
+        // an empty cell, 0, and "" fall in separate buckets — empties stay
+        // distinct, matching the spec — and numbers equal only within the
+        // engine's floating-point tolerance are likewise not collapsed.
         const representatives: InternalScalarValue[][] = []
         const occurrences: number[] = []
         const bucketsByKey = new Map<string, number[]>()

@@ -48,7 +48,11 @@ a circular reference.
 
 ### UNIQUE function
 
-* Value equality follows HyperFormula's own comparison rules, which honor the `caseSensitive` and `accentSensitive` configuration options (case-insensitive and accent-insensitive by default). As with the rest of the engine, an empty cell compares equal to `0` and to an empty string, so blanks collapse together with those values.
+* Text equality honors the `caseSensitive` and `accentSensitive` configuration options (case-insensitive and accent-insensitive by default), so values differing only in letter case or accents collapse to a single entry. Two cases intentionally differ from the engine's general comparison rules:
+
+  * An empty cell is treated as its own value. Unlike elsewhere in the engine, it is **not** equal to `0` or to an empty string, so blanks are kept separate from those values (repeated empty cells still collapse into one).
+
+  * Numbers are compared by their exact stored value, without the floating-point tolerance (`smartRounding`) applied elsewhere. Values that differ only by rounding — for example `0.3` and the result of `=0.1+0.2` — are therefore treated as distinct.
 
 * When the result would be empty (for example, `ExactlyOnce` set to `TRUE` removes every row), the function returns the `#N/A` error, mirroring the FILTER function.
 
